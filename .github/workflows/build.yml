@@ -1,0 +1,119 @@
+name: Build Windows and macOS
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows-x64
+          - os: macos-14
+            platform: macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build and package 1.0.0
+        shell: python
+        run: |
+          import subprocess
+          import sys
+          result = subprocess.run([sys.executable, "scripts/build.py"], stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+          print(result.stdout)
+          if result.returncode:
+              error = result.stdout[-16000:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print("::error title=Build output::" + error)
+          sys.exit(result.returncode)
+      - name: Pixel regression
+        run: ctest --test-dir build -C Release -R '^beauty-integration$' --output-on-failure
+      - name: Report pixel tests
+        if: always()
+        run: python tests/report.py ${{ job.status }}
+      - name: macOS stress tests
+        if: runner.os == 'macOS'
+        run: ctest --test-dir build -C Release -R '^beauty-stress$' --output-on-failure
+      - name: Verify and install the macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          unzip -q dist/OBS-Beauty-1.0.0-macos-arm64.zip -d "$RUNNER_TEMP/beauty-install"
+          /usr/bin/xattr -wr com.apple.quarantine '0081;00000000;OBS-Beauty;' "$RUNNER_TEMP/beauty-install/obs-beauty.plugin"
+          bash "$RUNNER_TEMP/beauty-install/install_OBS-Beauty.sh"
+          bash "$RUNNER_TEMP/beauty-install/install_OBS-Beauty.sh"
+          installed="$HOME/Library/Application Support/obs-studio/plugins/obs-beauty.plugin"
+          /usr/bin/codesign --verify --deep --strict "$installed"
+          if /usr/bin/xattr -lr "$installed" | grep -q 'com.apple.quarantine:'; then exit 1; fi
+          file "$installed/Contents/MacOS/obs-beauty" | grep arm64
+      - name: Report test results
+        if: always()
+        run: python tests/report.py ${{ job.status }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: OBS-Beauty-${{ matrix.platform }}
+          path: dist/*.zip
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: always() && runner.os == 'Windows'
+        with:
+          name: Validation-windows-x64
+          path: build/Release/beauty-integration.exe
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: Testlogs-${{ matrix.platform }}
+          path: build/Testing/Temporary/LastTest.log
+          retention-days: 7
+          if-no-files-found: warn
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: OBS-Beauty-*
+          path: artifacts
+      - name: Publish both ZIPs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if ! gh release view v1.0.0 >/dev/null 2>&1; then
+            gh release create v1.0.0 --target "$GITHUB_SHA" --title 'OBS-Beauty 1.0.0' --notes 'Lightweight beauty filter for OBS Studio 32.0.4. Windows x64 and macOS arm64. Extract the ZIP and run install_OBS-Beauty.'
+          fi
+          gh release upload v1.0.0 artifacts/OBS-Beauty-windows-x64/*.zip artifacts/OBS-Beauty-macos-arm64/*.zip --clobber
+      - name: Remove previous Actions runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          gh api --paginate "repos/$GH_REPO/actions/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[].id' > "$RUNNER_TEMP/beauty-previous-runs"
+          while read -r run_id; do
+            if [ "$run_id" != "$GITHUB_RUN_ID" ]; then
+              gh api --method DELETE "repos/$GH_REPO/actions/runs/$run_id"
+            fi
+          done < "$RUNNER_TEMP/beauty-previous-runs"

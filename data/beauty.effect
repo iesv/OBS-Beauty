@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float2 pixel_step;
+uniform float smoothing;
+uniform float blemish;
+uniform float sharpness;
+uniform float whitening;
+uniform float rosy;
+uniform float strength;
+uniform float skin_range;
+uniform int skin_preview;
+uniform float temperature;
+uniform float exposure;
+uniform float shadow_fill;
+uniform float color_saturation;
+
+sampler_state linear_sampler {
+    Filter = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VertData VSDefault(VertData vert_in)
+{
+    VertData result;
+    result.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+    result.uv = vert_in.uv;
+    return result;
+}
+
+float3 straight_rgb(float4 color)
+{
+    return color.a > 0.0001 ? color.rgb / color.a : float3(0.0, 0.0, 0.0);
+}
+
+float skin_mask(float3 color)
+{
+    float luminance = dot(color, float3(0.299, 0.587, 0.114));
+    float cb = 0.5 + dot(color, float3(-0.168736, -0.331264, 0.5));
+    float cr = 0.5 + dot(color, float3(0.5, -0.418688, -0.081312));
+    float2 chroma = (float2(cb, cr) - float2(0.40, 0.59)) / (0.10 * skin_range);
+    float chroma_mask = 1.0 - smoothstep(0.8, 2.2, dot(chroma, chroma));
+    float red_bias = smoothstep(0.01, 0.07, (color.r - color.b) / skin_range);
+    float exposure_mask = smoothstep(0.02, 0.09, luminance) * (1.0 - smoothstep(0.94, 1.0, luminance));
+    return saturate(chroma_mask * red_bias * exposure_mask);
+}
+
+float4 weighted_color(float4 sampled, float3 center, float spatial_weight, float luminance_weight)
+{
+    float3 color = straight_rgb(sampled);
+    float3 delta = color - center;
+    // Weight luminance and chroma differences separately.
+    float brightness_delta = (delta.r + delta.g + delta.b) / 3.0;
+    float3 chroma_delta = delta - brightness_delta;
+    float distance = dot(chroma_delta, chroma_delta) / (2.0 * 0.099 * 0.099) +
+                     brightness_delta * brightness_delta * luminance_weight;
+    float weight = spatial_weight * sampled.a * exp(-distance);
+    return float4(color * weight, weight);
+}
+
+float4 weighted_sample(float2 uv, float3 center, float spatial_weight, float luminance_weight)
+{
+    return weighted_color(image.Sample(linear_sampler, uv), center, spatial_weight, luminance_weight);
+}
+
+float4 finish_color(float4 original, float3 color, float mask)
+{
+    if (skin_preview == 2)
+        return float4(float3(mask, mask, mask) * original.a, original.a);
+    if (skin_preview == 1) {
+        float3 base = straight_rgb(original);
+        float gray = dot(base, float3(0.299, 0.587, 0.114));
+        base = lerp(float3(gray, gray, gray) * 0.55, base, mask);
+        return float4(lerp(base, float3(0.1, 1.0, 0.3), mask * 0.6) * original.a, original.a);
+    }
+    // A common RGB gain preserves hue/chroma ratios instead of washing channels toward white.
+    // Reduce the lift near highlights and limit the gain before any channel clips.
+    float luminance = dot(color, float3(0.299, 0.587, 0.114));
+    float peak = max(color.r, max(color.g, color.b));
+    float protection = 1.0 - smoothstep(0.70, 0.98, peak);
+    float gain = 1.0 + whitening * mask * 0.55 * (1.0 - luminance) * protection;
+    // Cap added gain without normalizing overshoot already present in SDR float input.
+    color *= min(gain, max(1.0, 1.0 / max(peak, 0.0001)));
+    float midtone = saturate(4.0 * color.g * (1.0 - color.g));
+    peak = max(color.r, max(color.g, color.b));
+    protection = 1.0 - smoothstep(0.70, 0.98, peak);
+    float blush = min(rosy * mask * midtone * protection, max(0.0, (1.0 - color.r) / 0.055));
+    color += blush * float3(0.055, -0.012, -0.006);
+    color = saturate(color);
+    color *= exp2(exposure) * float3(1.0 + 0.15 * temperature, 1.0, 1.0 - 0.15 * temperature);
+    float gray = dot(color, float3(0.299, 0.587, 0.114));
+    float shadow_gain = 1.0 + shadow_fill * 0.8 * (1.0 - smoothstep(0.10, 0.65, gray));
+    peak = max(color.r, max(color.g, color.b));
+    color *= min(shadow_gain, max(1.0, 1.0 / max(peak, 0.0001)));
+    gray = dot(color, float3(0.299, 0.587, 0.114));
+    color = lerp(float3(gray, gray, gray), color, 1.0 + color_saturation);
+    color = lerp(straight_rgb(original), saturate(color), strength);
+    return float4(color * original.a, original.a);
+}
+
+float4 PSColor(VertData vert_in) : TARGET
+{
+    float4 original = image.Sample(linear_sampler, vert_in.uv);
+    // Stabilize the middle pixel of odd-width sources against interpolation rounding.
+    if (skin_preview == 3 && vert_in.uv.x < 0.499999)
+        return original;
+    float3 color = straight_rgb(original);
+    // Lighting alone does not need a skin mask. This branch is uniform across the frame.
+    float mask = 0.0;
+    if (skin_preview == 1 || skin_preview == 2 || whitening > 0.0 || rosy > 0.0)
+        mask = skin_mask(color);
+    return finish_color(original, color, mask);
+}
+
+float4 PSSmooth(VertData vert_in) : TARGET
+{
+    float4 original = image.Sample(linear_sampler, vert_in.uv);
+    if (skin_preview == 3 && vert_in.uv.x < 0.499999)
+        return original;
+    float3 color = straight_rgb(original);
+    float mask = skin_mask(color);
+    // Skip neighborhood work outside the selection, keeping global lighting intact.
+    if ((mask <= 0.0 && sharpness <= 0.0) || original.a <= 0.0001)
+        return finish_color(original, color, mask);
+    float2 step = pixel_step;
+    float4 left = image.Sample(linear_sampler, vert_in.uv - step * float2(1.0, 0.0));
+    float4 right = image.Sample(linear_sampler, vert_in.uv + step * float2(1.0, 0.0));
+    float4 up = image.Sample(linear_sampler, vert_in.uv - step * float2(0.0, 1.0));
+    float4 down = image.Sample(linear_sampler, vert_in.uv + step * float2(0.0, 1.0));
+    float3 l = straight_rgb(left), r = straight_rgb(right);
+    float3 u = straight_rgb(up), d = straight_rgb(down);
+    float3 luma_weights = float3(0.299, 0.587, 0.114);
+    // Opposite-side differences protect contours; center contrast retains dark fine lines.
+    // Include alpha discontinuities so invisible colors cannot affect edge decisions.
+    float3 near_mean = (l + r + u + d) * 0.25;
+    float gradient = max(dot(abs(r - l), luma_weights), dot(abs(d - u), luma_weights));
+    float contrast = gradient;
+    contrast = max(contrast, dot(abs(color - near_mean), luma_weights));
+    float alpha_edge = max(max(abs(left.a - original.a), abs(right.a - original.a)),
+                           max(abs(up.a - original.a), abs(down.a - original.a)));
+    contrast = max(contrast, alpha_edge);
+    float detail = 1.0 - smoothstep(0.08, 0.22, contrast);
+    float3 fine = color;
+    if (smoothing > 0.0 && mask > 0.0) {
+        float luminance_sigma = 0.057 + 0.043 * smoothing;
+        float luminance_weight = 1.0 / (2.0 * luminance_sigma * luminance_sigma);
+        float4 sum = float4(color * 2.0, 2.0);
+        sum += weighted_color(left, color, 1.0, luminance_weight);
+        sum += weighted_color(right, color, 1.0, luminance_weight);
+        sum += weighted_color(up, color, 1.0, luminance_weight);
+        sum += weighted_color(down, color, 1.0, luminance_weight);
+        sum += weighted_sample(vert_in.uv + step * float2(-1.0, -1.0), color, 0.7, luminance_weight);
+        sum += weighted_sample(vert_in.uv + step * float2( 1.0, -1.0), color, 0.7, luminance_weight);
+        sum += weighted_sample(vert_in.uv + step * float2(-1.0,  1.0), color, 0.7, luminance_weight);
+        sum += weighted_sample(vert_in.uv + step * float2( 1.0,  1.0), color, 0.7, luminance_weight);
+        fine = sum.rgb / sum.a;
+    }
+    float3 repair_target = color;
+    float repair_weight = 0.0;
+    // A second scale uses four extra reads in this same pass: no history or extra textures.
+    // Skip it at low strength and at hard edges. Both scales always sample the original.
+    if ((smoothing > 0.25 || blemish > 0.0) && mask > 0.0 && detail > 0.001) {
+        float2 wide_step = step * 3.0;
+        float wide_sigma = 0.09 + 0.05 * smoothing;
+        float wide_weight = 1.0 / (2.0 * wide_sigma * wide_sigma);
+        float4 wide_sum = float4(fine, 1.0);
+        wide_sum += weighted_sample(vert_in.uv - wide_step * float2(1.0, 0.0), color, 1.0, wide_weight);
+        wide_sum += weighted_sample(vert_in.uv + wide_step * float2(1.0, 0.0), color, 1.0, wide_weight);
+        wide_sum += weighted_sample(vert_in.uv - wide_step * float2(0.0, 1.0), color, 1.0, wide_weight);
+        wide_sum += weighted_sample(vert_in.uv + wide_step * float2(0.0, 1.0), color, 1.0, wide_weight);
+        float3 wide = wide_sum.rgb / wide_sum.a;
+        float fine_luma = dot(fine, luma_weights), wide_luma = dot(wide, luma_weights);
+        float broad = smoothstep(0.25, 1.0, smoothing) * detail;
+        // Bounded local luminance/chroma corrections even faint spots without flattening lighting.
+        float tone_delta = clamp(wide_luma - fine_luma, -0.06, 0.06);
+        float3 chroma_delta = clamp((wide - wide_luma) - (fine - fine_luma), -0.025, 0.025);
+        fine += broad * (tone_delta * 0.55 + chroma_delta * 0.35);
+        float isolated = 1.0 - smoothstep(0.03, 0.14, gradient);
+        repair_target = wide;
+        repair_weight = blemish * detail * isolated * mask;
+    }
+    // Finer control at the low end; full strength retains a little original texture.
+    float amount = smoothing * (0.65 + 0.35 * smoothing) * 0.97;
+    float3 high_pass = clamp(color - near_mean, -0.04, 0.04);
+    float sharpen_gate = smoothstep(0.02, 0.10, gradient) * (1.0 - smoothstep(0.01, 0.10, alpha_edge));
+    color = lerp(color, fine, amount * mask * (0.35 + 0.65 * detail));
+    if (repair_weight > 0.0) {
+        float base_luma = dot(color, luma_weights), target_luma = dot(repair_target, luma_weights);
+        float spot_delta = clamp(target_luma - base_luma, -0.06, 0.06);
+        float3 spot_chroma = clamp((repair_target - target_luma) - (color - base_luma), -0.035, 0.035);
+        color += (spot_delta * 0.75 + spot_chroma * 0.5) * repair_weight;
+    }
+    color += high_pass * sharpness * 0.6 * sharpen_gate;
+    return finish_color(original, color, mask);
+}
+
+technique DrawSmooth {
+    pass {
+        vertex_shader = VSDefault(vert_in);
+        pixel_shader = PSSmooth(vert_in);
+    }
+}
+
+technique DrawColor {
+    pass {
+        vertex_shader = VSDefault(vert_in);
+        pixel_shader = PSColor(vert_in);
+    }
+}
